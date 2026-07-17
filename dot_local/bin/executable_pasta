@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#
+# pasta — write the clipboard contents to stdout.
+#
+# When running over SSH (or when no local clipboard tool is available) this
+# queries the terminal for the clipboard via an OSC 52 escape and decodes the
+# reply, so you read the *local* machine's clipboard.
+#
+# NOTE: reading the clipboard via OSC 52 must be permitted by your terminal.
+# In Ghostty this needs `clipboard-read = allow` (default is `ask`/`deny`);
+# most terminals disable clipboard *reads* by default for security.
+#
+set -euo pipefail
+
+over_ssh=0
+[[ -n ${SSH_CONNECTION:-} || -n ${SSH_TTY:-} || -n ${SSH_CLIENT:-} ]] && over_ssh=1
+
+# Prefer real local clipboard tools only when we are NOT on a remote session.
+if (( ! over_ssh )); then
+	if command -v pbpaste >/dev/null 2>&1; then
+		exec pbpaste
+	elif command -v wl-paste >/dev/null 2>&1; then
+		exec wl-paste --no-newline
+	elif command -v xclip >/dev/null 2>&1; then
+		exec xclip -selection clipboard -o
+	fi
+fi
+
+# OSC 52 query path. Talk directly to the controlling terminal.
+if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+	echo 'pasta: no terminal available to query the clipboard' >&2
+	exit 1
+fi
+tty=/dev/tty
+
+# Put the terminal in raw, no-echo mode so the reply doesn't print, and
+# restore the original settings no matter how we exit.
+old_stty=$(stty -g < "$tty")
+restore() { stty "$old_stty" < "$tty" 2>/dev/null || true; }
+trap restore EXIT
+stty -echo -icanon < "$tty"
+
+# Ask the terminal for the clipboard (with tmux/screen passthrough if needed).
+if [[ -n ${TMUX:-} ]]; then
+	printf '\033Ptmux;\033\033]52;c;?\a\033\\' > "$tty"
+elif [[ ${TERM:-} == screen* ]]; then
+	printf '\033P\033]52;c;?\a\033\\' > "$tty"
+else
+	printf '\033]52;c;?\a' > "$tty"
+fi
+
+# Read the reply: ESC ] 52 ; c ; <base64> (BEL | ESC \)
+# First byte gets a generous timeout to cover SSH latency / a permission
+# prompt; subsequent bytes arrive back-to-back.
+resp=""
+prev=""
+timeout=3
+while IFS= read -r -d '' -n 1 -t "$timeout" c < "$tty"; do
+	timeout=1
+	[[ $c == $'\a' ]] && break                 # BEL terminator
+	if [[ $prev == $'\033' && $c == '\' ]]; then  # ST (ESC \) terminator
+		resp=${resp%$'\033'}
+		break
+	fi
+	resp+=$c
+	prev=$c
+done
+
+restore
+trap - EXIT
+
+# The base64 payload is everything after the final ';' (the standard base64
+# alphabet contains no ';').
+b64=${resp##*;}
+if [[ -z $b64 || $b64 == "$resp" ]]; then
+	echo 'pasta: no clipboard reply from terminal (is clipboard-read allowed?)' >&2
+	exit 1
+fi
+
+printf '%s' "$b64" | base64 -d 2>/dev/null || printf '%s' "$b64" | base64 --decode

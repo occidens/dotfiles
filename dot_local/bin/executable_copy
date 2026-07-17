@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# copy — send stdin to the clipboard.
+#
+# When running over SSH (or when no local clipboard tool is available) this
+# uses an OSC 52 terminal escape sequence, so the *local* machine's clipboard
+# is set by the terminal emulator (Ghostty, iTerm2, kitty, wezterm, tmux, ...).
+#
+set -euo pipefail
+
+# Slurp all of stdin, preserving any trailing newlines during capture.
+input=$(cat && printf x); input=${input%x}
+# Match historical behaviour: drop a single trailing newline (like `chomp`).
+input=${input%$'\n'}
+
+over_ssh=0
+[[ -n ${SSH_CONNECTION:-} || -n ${SSH_TTY:-} || -n ${SSH_CLIENT:-} ]] && over_ssh=1
+
+# Prefer real local clipboard tools only when we are NOT on a remote session;
+# over SSH those would target the remote box, not the machine you're sitting at.
+if (( ! over_ssh )); then
+	if command -v pbcopy >/dev/null 2>&1; then
+		printf '%s' "$input" | pbcopy; exit
+	elif command -v wl-copy >/dev/null 2>&1; then
+		printf '%s' "$input" | wl-copy; exit
+	elif command -v xclip >/dev/null 2>&1; then
+		printf '%s' "$input" | xclip -selection clipboard; exit
+	fi
+fi
+
+# OSC 52 path. Encode payload as single-line base64.
+b64=$(printf '%s' "$input" | base64 | tr -d '\n')
+
+# Write the escape to the controlling terminal, never to stdout (which may be
+# redirected to a pipe or file). Fall back to stderr if there's no tty.
+if { : > /dev/tty; } 2>/dev/null; then tty=/dev/tty; else tty=/dev/stderr; fi
+
+if [[ -n ${TMUX:-} ]]; then
+	# tmux passthrough: wrap the sequence and double the inner ESC.
+	printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$b64" > "$tty"
+elif [[ ${TERM:-} == screen* ]]; then
+	printf '\033P\033]52;c;%s\a\033\\' "$b64" > "$tty"
+else
+	printf '\033]52;c;%s\a' "$b64" > "$tty"
+fi
